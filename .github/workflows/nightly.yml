@@ -1,0 +1,208 @@
+name: Nightly
+
+# Nightly APK build that follows the upstream project (alan7383/kittytune).
+#
+# GitHub cannot trigger a fork's workflow when the upstream repo gets a push,
+# so this polls instead: every night it looks at the head commit of the
+# upstream branch (default `dev`, same branch upstream uses for its betas).
+# If that commit has not been built yet, it merges it into this fork inside
+# the runner (nothing is pushed back to your branches), builds a signed
+# release APK and publishes it as a pre-release named nightly-<date>-<sha>.
+# If there is nothing new, the run stops after a few seconds.
+#
+# Signing: add the secrets KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS and
+# KEY_PASSWORD so every nightly is signed with the same key and installs as an
+# update over the previous one. Without them a throwaway key is generated on
+# each run (APKs install, but you must uninstall before each update).
+#
+# Manual run: Actions -> Nightly -> Run workflow (pick another upstream
+# branch, or tick "force" to rebuild a commit that was already built).
+
+on:
+  schedule:
+    - cron: '17 19 * * *'   # 19:17 UTC = 02:17 in Vietnam (UTC+7)
+  workflow_dispatch:
+    inputs:
+      upstream_branch:
+        description: 'Upstream branch to build'
+        required: false
+        default: 'dev'
+      force:
+        description: 'Build even if this upstream commit was already built'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: alan7383/kittytune
+  UPSTREAM_BRANCH: ${{ inputs.upstream_branch || 'dev' }}
+  KEEP_NIGHTLIES: 7
+
+jobs:
+  check:
+    name: Check upstream for new commits
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Compare upstream head with last nightly
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          SHA=$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "refs/heads/${UPSTREAM_BRANCH}" | cut -f1)
+          if [ -z "$SHA" ]; then
+            echo "::error::Branch ${UPSTREAM_BRANCH} not found on ${UPSTREAM_REPO}"
+            exit 1
+          fi
+          SHORT=${SHA:0:7}
+          echo "Upstream ${UPSTREAM_BRANCH} head: ${SHA}"
+          if [ "$FORCE" != "true" ] && gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' | grep -q -- "^nightly-.*-${SHORT}$"; then
+            echo "Upstream commit ${SHORT} already built - nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build & Publish Nightly
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ubuntu-22.04
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'nightly-build' }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'nightly' }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'nightly-build' }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Merge upstream into the fork *inside the runner only*. Your own
+      # changes in the fork are kept; if they conflict with upstream the job
+      # fails instead of building something half-merged.
+      - name: Merge upstream
+        id: up
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          UP_SHA=$(git rev-parse FETCH_HEAD)
+          SHORT=${UP_SHA:0:7}
+          if ! git merge --no-edit "$UP_SHA"; then
+            git merge --abort || true
+            echo "::error::Merge conflict between this fork and upstream/${UPSTREAM_BRANCH}. Resolve it in the fork."
+            exit 1
+          fi
+          DATE=$(date -u +%Y%m%d)
+          BASE_NAME=$(grep -m1 'versionName = ' app/build.gradle.kts | sed 's/.*"\(.*\)".*/\1/')
+          echo "sha=$UP_SHA" >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-${DATE}-${SHORT}" >> "$GITHUB_OUTPUT"
+          echo "name=${BASE_NAME}-nightly.${DATE}" >> "$GITHUB_OUTPUT"
+          # Bake the nightly version name into this build (nothing is committed)
+          sed -i "s/versionName = \".*\"/versionName = \"${BASE_NAME}-nightly.${DATE}\"/" app/build.gradle.kts
+          grep -m1 'versionName = ' app/build.gradle.kts
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Cache Gradle
+        uses: burrunan/gradle-cache-action@v3
+
+      - name: Install ccache
+        run: sudo apt-get update && sudo apt-get install -y ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-ndk27.1.12297006-${{ hashFiles('app/src/main/cpp/**') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-ndk27.1.12297006-
+
+      - name: Setup Android NDK
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;27.1.12297006"
+
+      - name: Accept Android SDK Licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Prepare signing keystore
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > app/keystore.jks
+          else
+            echo "::warning::KEYSTORE_BASE64 secret not set - signing with a throwaway key. Add the signing secrets to get updatable APKs."
+            keytool -genkeypair -keystore app/keystore.jks -storetype PKCS12 \
+              -alias "$KEY_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" \
+              -dname "CN=KittyTune Nightly"
+          fi
+
+      - name: Build release APK
+        env:
+          USE_CCACHE: '1'
+          CCACHE_DIR: ~/.ccache
+          CCACHE_MAXSIZE: 2G
+        run: |
+          ./gradlew assembleRelease -x lintVitalRelease --stacktrace \
+            -Pandroid.injected.signing.store.file=$PWD/app/keystore.jks \
+            -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD \
+            -Pandroid.injected.signing.key.alias=$KEY_ALIAS \
+            -Pandroid.injected.signing.key.password=$KEY_PASSWORD
+
+      - name: Write release notes
+        env:
+          UP_SHA: ${{ steps.up.outputs.sha }}
+          SHORT: ${{ steps.up.outputs.short }}
+        run: |
+          PREV=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("nightly-"))] | sort_by(.createdAt) | reverse | (.[0].tagName // "")')
+          PREV_SHA=${PREV##*-}
+          if [ -n "$PREV_SHA" ] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
+            RANGE="${PREV_SHA}..${UP_SHA}"
+          else
+            RANGE="--max-count=20 ${UP_SHA}"
+          fi
+          {
+            echo "> [!WARNING]"
+            echo "> **Nightly build** of upstream \`${UPSTREAM_BRANCH}\` at [\`${SHORT}\`](https://github.com/${UPSTREAM_REPO}/commit/${UP_SHA}). May be unstable."
+            echo ""
+            echo "### Upstream changes"
+            git log --no-merges --pretty='- %s (%h, %an)' $RANGE
+          } > NIGHTLY_NOTES.md
+
+      - name: Prune old nightlies
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            --jq "[.[] | select(.tagName | startswith(\"nightly-\"))] | sort_by(.createdAt) | reverse | .[$((KEEP_NIGHTLIES - 1)):] | .[].tagName" \
+          | while read -r t; do
+              gh release delete "$t" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+            done
+
+      - name: Publish pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.up.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "KittyTune Nightly ${{ steps.up.outputs.name }} (${{ steps.up.outputs.short }})"
+          body_path: NIGHTLY_NOTES.md
+          files: app/build/outputs/apk/release/*.apk
+          prerelease: true
+          make_latest: false
+          token: ${{ secrets.GITHUB_TOKEN }}
