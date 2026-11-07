@@ -7,8 +7,16 @@ name: Nightly
 # upstream branch (default `dev`, same branch upstream uses for its betas).
 # If that commit has not been built yet, it merges it into this fork inside
 # the runner (nothing is pushed back to your branches), builds a signed
-# release APK and publishes it as a pre-release named nightly-<date>-<sha>.
+# release APK and publishes it as a pre-release tagged v<version>-nightly.<date>.<run>.
 # If there is nothing new, the run stops after a few seconds.
+#
+# The nightly uses the package com.wynriu.kittytune.nightly, so it installs
+# side by side with the official KittyTune (same app name, separate data).
+#
+# In-app updates: the app's built-in update checker is patched at build time
+# to read THIS repo's releases (the original one is hard-coded to upstream),
+# so the nightly offers the next nightly. The repo must be public, because the
+# app calls the GitHub API without logging in.
 #
 # Signing: add the secrets KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS and
 # KEY_PASSWORD so every nightly is signed with the same key and installs as an
@@ -64,7 +72,7 @@ jobs:
           fi
           SHORT=${SHA:0:7}
           echo "Upstream ${UPSTREAM_BRANCH} head: ${SHA}"
-          if [ "$FORCE" != "true" ] && gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' | grep -q -- "^nightly-.*-${SHORT}$"; then
+          if [ "$FORCE" != "true" ] && gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json name --jq '.[].name' | grep -qF "(${SHORT})"; then
             echo "Upstream commit ${SHORT} already built - nothing to do."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
@@ -108,13 +116,38 @@ jobs:
           fi
           DATE=$(date -u +%Y%m%d)
           BASE_NAME=$(grep -m1 'versionName = ' app/build.gradle.kts | sed 's/.*"\(.*\)".*/\1/')
+          # The in-app updater compares the release tag with the APK's
+          # versionName, so the tag must be exactly "v" + versionName. The
+          # parts after "nightly." are numeric (date, then run number) so
+          # the app can tell which nightly is newer.
+          NIGHTLY_NAME="${BASE_NAME}-nightly.${DATE}.${GITHUB_RUN_NUMBER}"
           echo "sha=$UP_SHA" >> "$GITHUB_OUTPUT"
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
-          echo "tag=nightly-${DATE}-${SHORT}" >> "$GITHUB_OUTPUT"
-          echo "name=${BASE_NAME}-nightly.${DATE}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${NIGHTLY_NAME}" >> "$GITHUB_OUTPUT"
+          echo "name=${NIGHTLY_NAME}" >> "$GITHUB_OUTPUT"
           # Bake the nightly version name into this build (nothing is committed)
-          sed -i "s/versionName = \".*\"/versionName = \"${BASE_NAME}-nightly.${DATE}\"/" app/build.gradle.kts
+          sed -i "s/versionName = \".*\"/versionName = \"${NIGHTLY_NAME}\"/" app/build.gradle.kts
           grep -m1 'versionName = ' app/build.gradle.kts
+          # Separate package so the nightly installs next to the official app.
+          # Only applicationId changes: the code namespace and the app name
+          # ("KittyTune") stay as they are.
+          sed -i 's/applicationId = "com\.alananasss\.kittytune"/applicationId = "com.wynriu.kittytune.nightly"/' app/build.gradle.kts
+          if ! grep -q 'applicationId = "com.wynriu.kittytune.nightly"' app/build.gradle.kts; then
+            echo "::error::Could not set the nightly applicationId - did upstream change app/build.gradle.kts?"
+            exit 1
+          fi
+          # Update channel: the app's update checker is hard-wired to the
+          # upstream repo. Point it at THIS repo's releases instead. A nightly
+          # version has a "-nightly.x" suffix, which the app treats as a beta
+          # build, so it always uses the "releases list" (prerelease) endpoint
+          # and offers the newest nightly from here.
+          API_FILE=app/src/main/java/com/alananasss/kittytune/data/network/GithubApi.kt
+          sed -i "s#repos/alan7383/kittytune/#repos/${GITHUB_REPOSITORY}/#g" "$API_FILE"
+          if [ "$(grep -c "repos/${GITHUB_REPOSITORY}/releases" "$API_FILE")" -lt 2 ]; then
+            echo "::error::Could not redirect the update channel - did upstream change GithubApi.kt?"
+            exit 1
+          fi
+          grep -n 'repos/' "$API_FILE"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -171,9 +204,9 @@ jobs:
           UP_SHA: ${{ steps.up.outputs.sha }}
           SHORT: ${{ steps.up.outputs.short }}
         run: |
-          PREV=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("nightly-"))] | sort_by(.createdAt) | reverse | (.[0].tagName // "")')
-          PREV_SHA=${PREV##*-}
+          PREV_SHA=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json name,createdAt \
+            --jq '[.[] | select(.name | startswith("KittyTune Nightly"))] | sort_by(.createdAt) | reverse | (.[0].name // "")' \
+            | sed -n 's/.*(\([0-9a-f]\{7,\}\))$/\1/p')
           if [ -n "$PREV_SHA" ] && git cat-file -e "${PREV_SHA}^{commit}" 2>/dev/null; then
             RANGE="${PREV_SHA}..${UP_SHA}"
           else
@@ -189,8 +222,8 @@ jobs:
 
       - name: Prune old nightlies
         run: |
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
-            --jq "[.[] | select(.tagName | startswith(\"nightly-\"))] | sort_by(.createdAt) | reverse | .[$((KEEP_NIGHTLIES - 1)):] | .[].tagName" \
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,name,createdAt \
+            --jq "[.[] | select(.name | startswith(\"KittyTune Nightly\"))] | sort_by(.createdAt) | reverse | .[$((KEEP_NIGHTLIES - 1)):] | .[].tagName" \
           | while read -r t; do
               gh release delete "$t" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
             done
